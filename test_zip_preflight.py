@@ -166,6 +166,176 @@ class NamePolicyTests(Base):
     def test_backslash_inside(self):
         self.assertIn("ambiguous_windows_separator", codes(self.bad(r"dir\file.txt")))
 
+import io
+import json
+import os
+from pathlib import Path
+import stat
+import tempfile
+import unittest
+from unittest.mock import patch
+import zipfile
+from zip_preflight import inspect_archive, main, PreflightError
+
+
+def make_zip(path, entries):
+    """entries: (name, data, kind, compression). kind: file/dir/symlink/special/encrypted."""
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, data, *rest in entries:
+            kind = rest[0] if rest else "file"
+            compression = rest[1] if len(rest) > 1 else zipfile.ZIP_DEFLATED
+            info = zipfile.ZipInfo("placeholder")
+            # Set after construction: ZipInfo.__init__ rewrites os.sep to "/"
+            # on Windows, which would hide backslash-hostile member names.
+            info.filename = name
+            info.compress_type = compression
+            if kind == "dir":
+                info.external_attr = (stat.S_IFDIR | 0o755) << 16
+            elif kind == "symlink":
+                info.create_system = 3
+                info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            elif kind == "special":
+                info.create_system = 3
+                info.external_attr = (stat.S_IFIFO | 0o644) << 16
+            elif kind == "encrypted":
+                info.flag_bits |= 0x1
+            archive.writestr(info, data)
+
+
+
+def patch_all_headers(path, sig, offset, patch):
+    raw = bytearray(path.read_bytes())
+    start = 0
+    while True:
+        try:
+            pos = raw.index(sig, start)
+        except ValueError:
+            break
+        patch(raw, pos + offset)
+        start = pos + 4
+    path.write_bytes(raw)
+
+
+def set_encrypted_flag(path):
+    """Set the general-purpose encrypted bit in local and central headers."""
+    patch_all_headers(path, b"PK\x03\x04", 6, lambda r, p: r.__setitem__(p, r[p] | 0x1))
+    patch_all_headers(path, b"PK\x01\x02", 8, lambda r, p: r.__setitem__(p, r[p] | 0x1))
+
+
+def forge_declared_sizes(path, fake_size):
+    """Lie about uncompressed sizes in every header; data and CRC stay real."""
+    def put(raw, pos):
+        raw[pos:pos + 4] = fake_size.to_bytes(4, "little")
+    patch_all_headers(path, b"PK\x03\x04", 22, put)
+    patch_all_headers(path, b"PK\x01\x02", 24, put)
+
+def codes(report):
+    return [item["code"] for item in report["errors"]]
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "sample.zip"
+
+    def inspect(self, entries, **options):
+        make_zip(self.path, entries)
+        return inspect_archive(self.path, **options)
+
+
+class SafeArchiveTests(Base):
+    def test_empty_archive(self):
+        self.assertTrue(self.inspect([])["ok"])
+
+    def test_single_file(self):
+        self.assertTrue(self.inspect([("hello.txt", b"hi")])["ok"])
+
+    def test_nested_file(self):
+        self.assertTrue(self.inspect([("docs/a/b.txt", b"hi")])["ok"])
+
+    def test_explicit_directory(self):
+        self.assertTrue(self.inspect([("docs/", b"", "dir"), ("docs/a.txt", b"hi")])["ok"])
+
+    def test_case_distinct_no_collision(self):
+        self.assertTrue(self.inspect([("one.txt", b"1"), ("two.txt", b"2")])["ok"])
+
+    def test_unicode_name(self):
+        self.assertTrue(self.inspect([("नमस्ते.txt", "hello".encode())])["ok"])
+
+    def test_spaces_inside_name(self):
+        self.assertTrue(self.inspect([("my file.txt", b"hi")])["ok"])
+
+    def test_space_before_extension(self):
+        self.assertTrue(self.inspect([("name .txt", b"hi")])["ok"])
+
+    def test_plus_and_dash(self):
+        self.assertTrue(self.inspect([("a+b-c.txt", b"hi")])["ok"])
+
+    def test_stored(self):
+        self.assertTrue(self.inspect([("a.bin", b"123", "file", zipfile.ZIP_STORED)])["ok"])
+
+    def test_bzip2(self):
+        self.assertTrue(self.inspect([("a.bin", b"123", "file", zipfile.ZIP_BZIP2)])["ok"])
+
+    def test_lzma(self):
+        self.assertTrue(self.inspect([("a.bin", b"123", "file", zipfile.ZIP_LZMA)])["ok"])
+
+    def test_deep_allowed(self):
+        self.assertTrue(self.inspect([("/".join(f"d{i}" for i in range(8)) + "/a.txt", b"x")])["ok"])
+
+    def test_payload_verified(self):
+        report = self.inspect([("a.txt", b"hello")], verify_payload=True)
+        self.assertTrue(report["payload_verified"])
+        self.assertEqual(report["summary"]["verified_uncompressed_bytes"], 5)
+
+    def test_payload_large_allowed(self):
+        report = self.inspect([("a.bin", b"x" * 200000)], verify_payload=True, max_ratio=0)
+        self.assertTrue(report["ok"])
+
+    def test_ratio_disabled(self):
+        report = self.inspect([("a.txt", b"x" * 10000)], verify_payload=True, max_ratio=0)
+        self.assertTrue(report["ok"])
+
+    def test_default_warning(self):
+        self.assertIn("payload_not_verified", [x["code"] for x in self.inspect([("a", b"1")])["warnings"]])
+
+    def test_verify_no_default_warning(self):
+        self.assertEqual(self.inspect([("a", b"1")], verify_payload=True)["warnings"], [])
+
+
+class NamePolicyTests(Base):
+    def bad(self, name):
+        return self.inspect([(name, b"x")])
+
+    def test_parent_traversal(self):
+        self.assertIn("dot_dot_path_component", codes(self.bad("../evil.txt")))
+
+    def test_embedded_traversal(self):
+        self.assertIn("dot_dot_path_component", codes(self.bad("safe/../evil.txt")))
+
+    def test_absolute_posix(self):
+        self.assertIn("absolute_path", codes(self.bad("/tmp/evil.txt")))
+
+    def test_absolute_unc_slashes(self):
+        report = self.bad("//server/share/file.txt")
+        self.assertIn("absolute_path", codes(report))
+
+    def test_windows_drive_forward(self):
+        self.assertIn("windows_drive_path", codes(self.bad("C:/Windows/file.txt")))
+
+    def test_windows_drive_backslash(self):
+        report = self.bad(r"C:\Windows\file.txt")
+        self.assertIn("windows_drive_path", codes(report))
+        self.assertIn("ambiguous_windows_separator", codes(report))
+
+    def test_unc_backslash(self):
+        report = self.bad(r"\\server\share\file.txt")
+        self.assertIn("absolute_path", codes(report))
+
+    def test_backslash_inside(self):
+        self.assertIn("ambiguous_windows_separator", codes(self.bad(r"dir\file.txt")))
+
     def test_empty_component(self):
         self.assertIn("empty_path_component", codes(self.bad("dir//file.txt")))
 
